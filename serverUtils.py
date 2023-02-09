@@ -29,9 +29,9 @@ MONGO_USER = config('USER')
 MONGO_PASS = config('PASS')
 CONNECTION_STRING = f'mongodb+srv://{MONGO_USER}:{MONGO_PASS}@cluster0.fgvaysh.mongodb.net/?retryWrites=true&w=majority'
 # mongo collections
-MONGO_PRODUCT_DB = 'Products'
-MONGO_PRODUCT_ARTICLE_COLLECTION = 'Articles'
-MONGO_PRODUCT_PRODUCT_COLLECTION = 'Products'
+MONGO_PRODUCT_DB = 'uncoverpc'
+MONGO_PRODUCT_ARTICLE_COLLECTION = 'articles'
+MONGO_PRODUCT_PRODUCT_COLLECTION = 'laptops'  # TODO change to generic product
 MONGO_PRODUCT_TITLE_KEY = 'Name'
 MONGO_PRODUCT_LINK_KEY = 'Link'
 MONGO_PRODUCT_PRICE_KEY = 'Price'
@@ -43,7 +43,7 @@ MONGO_ARTICLE_DOM_KEY = 'dom'
 ELASTIC_HOST = 'localhost'
 ELASTIC_PORT = 9200
 ELASTIC_SCHEME = 'http'
-ELASTIC_PRODUCT_INDEX = 'products'
+ELASTIC_PRODUCT_INDEX = 'productsv3'
 ELASTIC_PRODUCT_PROPERTIES_KEY = 'properties'
 ELASTIC_ARTICLE_INDEX = 'articles'
 ELASTIC_PRODUCTID_KEY = 'ProductID'
@@ -68,6 +68,7 @@ SPLIT_BY_COMMA = ','
 SPLIT_NEW_LINE = '\n'
 SPACE = ' '
 HTML_TEXT_CONTAINER = 'p'
+SPECIAL_CHARACTERS = "@^*+?_=,<>/|\"}{[]"
 # AI models
 SEMANTIC_SEARCH = 'msmarco-distilbert-base-v4'
 SENTIMENT_ANALYSIS = 'sentiment'
@@ -154,6 +155,7 @@ class ElasticSearchImports(object):
         return es
 
     def indexArticle(self, link, title, dom, relatedProduct):
+        print("Indexing article: {}", link)
         artUUID = uuid.uuid4()
         self.es.index(
             index=ELASTIC_ARTICLE_INDEX,
@@ -182,12 +184,13 @@ class ElasticSearchImports(object):
                 host = terms[0]
             if host in para.text:
                 continue
-            if para.text.count(SPLIT_BY_PERIOD) < 3:
-                continue
             text = para.text
             text.replace(
                 SPLIT_NEW_LINE, SPLIT_BY_PERIOD+SPACE)
             for p in text.split(SPLIT_BY_PERIOD+SPACE):
+                # Filter
+                if any(c in SPECIAL_CHARACTERS for c in p):
+                    continue
                 # Get vector mapping for each sentence
                 semanticVectors = self.tokenizer.get_token(p)
                 # Get sentiment vector for sentence
@@ -214,97 +217,125 @@ class ElasticSearchImports(object):
             self.indexArticle(article[MONGO_ARTICLE_LINK_KEY], article[MONGO_ARTICLE_TITLE_KEY],
                               article[MONGO_ARTICLE_DOM_KEY], relatedProduct)
 
-    def getTopProduct(self, products):
-        tops = None
-        count = 0
-        for product in products:
-            if count == 0:
-                tops = product
-                count = count + 1
-            if (products[product][SCORE] > products[tops][SCORE]):
-                tops = product
-        product = self.mongo.getProduct(tops)[0]
-        result = {
-            'Product': products[tops],
-            MONGO_ARTICLE_TITLE_KEY: product[MONGO_PRODUCT_TITLE_KEY],
-            MONGO_PRODUCT_LINK_KEY: product[MONGO_PRODUCT_LINK_KEY],
-            MONGO_PRODUCT_PRICE_KEY: product[MONGO_PRODUCT_PRICE_KEY]
-        }
-        return result
-
-# TODO fix algorithm
-    def rankProducts(self, products, property, index, productId, count):
-        id = productId
-        if id in products:
-            # Adding score
-            if property in products[id][ELASTIC_PRODUCT_PROPERTIES_KEY]:
-                products[id][ELASTIC_PRODUCT_PROPERTIES_KEY][property][SENTIMENT_SCORE] = products[id][ELASTIC_PRODUCT_PROPERTIES_KEY][property][SCORE] + \
-                    index[ELASTIC_REVELVANT_ARTICLE][SENTIMENT_SCORE]
-                products[id][SCORE] = products[id][SCORE] + \
-                    index[SCORE]
-            else:
-                products[id][ELASTIC_PRODUCT_PROPERTIES_KEY][property] = index
-                products[id][SCORE] = products[id][SCORE] + \
-                    index[SCORE]
-            # Adding relevant articles -> contains link, title, and relevant article snippet
-            products[id][ELASTIC_PRODUCT_PROPERTIES_KEY][property] = index
-        else:
-            product = {
-                SCORE: index[SCORE],
-                ELASTIC_PRODUCT_PROPERTIES_KEY: {
-                    property: index
+    def getArticleData(self, articleID):
+        articleQuery = {
+            'query': {
+                'match': {
+                    ELASTIC_ARTICLEID_KEY: {
+                        'query': articleID
+                    },
                 }
             }
-            products[id] = product
+        }
+        article = self.es.options().search(
+            index=ELASTIC_ARTICLE_INDEX, body=articleQuery, request_timeout=55)
+        articleData = [x['_source']
+                       for x in article['hits']['hits']][0]
+        data = {ELASTIC_ARTICLE_TITLEID_KEY: articleData[ELASTIC_ARTICLE_TITLEID_KEY],
+                ELASTIC_ARTICLE_LINKID_KEY: articleData[ELASTIC_ARTICLE_LINKID_KEY]}
+        return data
 
-        return products
+    def getArticleForProduct(self, product):
+        for x, property in enumerate(product['properties']):
+            articleQuery = {
+                'query': {
+                    'match': {
+                        ELASTIC_ARTICLEID_KEY: {
+                            'query': property[ELASTIC_ARTICLEID_KEY]
+                        },
+                    }
+                }
+            }
+            article = self.es.options().search(
+                index=ELASTIC_ARTICLE_INDEX, body=articleQuery, request_timeout=55)
+            articleData = [x['_source']
+                           for x in article['hits']['hits']][0]
+            product['properties'][x]['title'] = articleData[ELASTIC_ARTICLE_TITLEID_KEY]
+            product['properties'][x]['link'] = articleData[ELASTIC_ARTICLE_LINKID_KEY]
+        return product
+
+    def getIndexMatch(self, newProduct, previousProducts):
+        for x, previousProduct in enumerate(previousProducts):
+            if newProduct['_source'][ELASTIC_PRODUCTID_KEY] == previousProduct[ELASTIC_PRODUCTID_KEY]:
+                return x
+        return -1
+
+    # TODO increase efficiency
+    def rankProducts(self, newProducts, newProperty, previousProducts):
+        for newProduct in newProducts:
+            properties = {
+                'property': newProperty,
+                ELASTIC_ARTICLEID_KEY: newProduct['_source'][ELASTIC_ARTICLEID_KEY],
+                ELASTIC_ARTICLE_SAMPLE_KEY: newProduct['_source'][ELASTIC_ARTICLE_SAMPLE_KEY],
+                "_sentiment_score": newProduct['_sentiment_score'],
+                "_relevance_score": newProduct['_score']
+            }
+            index = self.getIndexMatch(newProduct, previousProducts)
+            if (index < 0):  # If product doesnt exist in previous data
+                product = {
+                    ELASTIC_PRODUCTID_KEY: newProduct['_source'][ELASTIC_PRODUCTID_KEY],
+                    "_total_score": newProduct['_total_score'],
+                    "_valid_properties": [newProperty],
+                    'properties': [properties]
+                }
+                previousProducts.append(product)
+            else:
+                if newProperty not in previousProducts[index]['_valid_properties']:
+                    previousProducts[index]['_total_score'] += newProduct['_total_score']
+                    previousProducts[index]['_valid_properties'].append(
+                        newProperty)
+                    previousProducts[index]['properties'].append(properties)
+                else:
+                    previousProducts[index]['_total_score'] += newProduct['_total_score']
+        return previousProducts
 
     def searchQuery(self, query):
-        products = {}
+        products = []
         for property in query:
             token_vector = self.tokenizer.get_token(property)
             sentiment_vector = self.tokenizer.get_sentiment_token(property)
             query = {
-                "query": {
-                    "elastiknn_nearest_neighbors": {
-                        "vec": token_vector,
-                        "field": ELASTIC_ARTICLE_SAMPLE_VECTOR_KEY,
-                        "similarity": SIMILARITY,
-                        "model": MODEL,
-                    }
+                "size": 20,
+                "knn": {
+                    "field": ELASTIC_ARTICLE_SAMPLE_VECTOR_KEY,
+                    "query_vector": token_vector,
+                    "k": 20,
+                    "num_candidates": 100
                 },
-                'size': NUM_RESULT
+                "min_score": 0.7,
+                "_source": {
+                    "exclude":
+                        ["ArticleSampleVector"]
+
+                }
             }
             res = self.es.options().search(index=ELASTIC_PRODUCT_INDEX,
                                            body=query,
                                            request_timeout=55)
-            data = [x['_source'] for x in res['hits']['hits']]
+            data = res['hits']['hits']
             # Getting cos_sim based on sentiment
             count = 0
-            for x in data:
+            for index, x in enumerate(data):
+
                 count = count+1
-                function = (-1/NUM_RESULT * count + 1)
-                sentiment = x[ELASTIC_ARTICLE_SAMPLE_SENTIMENT_VECTOR_KEY]
-                # article = mongo.getArticleById(x['ProductID'])
+                sentiment = x['_source'][ELASTIC_ARTICLE_SAMPLE_SENTIMENT_VECTOR_KEY]
+                # # article = mongo.getArticleById(x['ProductID'])
                 cosine_sim = cos_sim(
                     np.array(sentiment_vector), np.array(sentiment))
+                x['_sentiment_score'] = cosine_sim
+                x['_total_score'] = cosine_sim + x['_score']
+            # Filtering out null matches
+            data[:] = [x for x in data if x['_score']
+                       >= 0.75 and x['_sentiment_score'] >= 0.9]
+            data.sort(key=lambda x: x['_total_score'], reverse=True)
+            products = self.rankProducts(data, property, products)
+        products.sort(key=lambda x: x['_total_score'], reverse=True)
+        # Get top three
+        products = products[0:min(3, len(products))]
+        for x in range(0, min(3, len(products))):
+            products[x] = self.getArticleForProduct(products[x])
 
-                index = {
-                    SCORE: function + cosine_sim,
-                    ELASTIC_REVELVANT_ARTICLE: {
-                        'title': '',
-                        'link': '',
-                        'articleSample': x[ELASTIC_ARTICLE_SAMPLE_KEY],
-                        'boldStart': '',
-                        'boldEnd': '',
-                        SENTIMENT_SCORE: cosine_sim
-                    }
-                }
-                products = self.rankProducts(
-                    products, property, index, x[ELASTIC_PRODUCTID_KEY], function)
-
-        product = self.getTopProduct(products)
-        return product
+        return products
 
 
 def cos_sim(a, b):
